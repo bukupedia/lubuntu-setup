@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
-
-trap 'echo "[ERROR] Error occurred at line $LINENO. Suggested cleanup: sudo apt-get install -f && sudo dpkg --configure -a"' ERR
+# Safer error handling without ERR trap that could fail
+set -uo pipefail
 
 # =========================================================
 # Ubuntu 22.04 RDP Provisioning Script
@@ -13,7 +12,7 @@ trap 'echo "[ERROR] Error occurred at line $LINENO. Suggested cleanup: sudo apt-
 # =========================================================
 
 REAL_USER=${SUDO_USER:-$USER}
-REAL_HOME=$(eval echo "~${REAL_USER}")
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 
 LOG_INFO="[INFO]"
 LOG_WARN="[WARN]"
@@ -36,15 +35,39 @@ log_error() {
 }
 
 # ---------------------------------------------------------
-# Safety Backup Function
+# Safety Backup Function with Timestamped Versions
 # ---------------------------------------------------------
 
 safe_edit() {
     local file="$1"
-
+    
     if [[ -f "$file" ]]; then
-        cp -p "$file" "$file.bak"
-        log_info "Backup created: ${file}.bak"
+        local timestamp
+        timestamp=$(date +%Y%m%d_%H%M%S)
+        if cp -p "$file" "${file}.bak_${timestamp}"; then
+            log_info "Backup created: ${file}.bak_${timestamp}"
+        else
+            log_warn "Failed to create backup of ${file}"
+        fi
+    fi
+}
+
+# ---------------------------------------------------------
+# Execute with Error Handling
+# ---------------------------------------------------------
+
+run_or_fail() {
+    local description="$1"
+    shift
+    
+    log_info "${description}..."
+    if "$@"; then
+        log_info "${description} - OK"
+        return 0
+    else
+        local exit_code=$?
+        log_error "${description} - FAILED (exit code: ${exit_code})"
+        return $exit_code
     fi
 }
 
@@ -52,13 +75,14 @@ safe_edit() {
 # Root Check
 # ---------------------------------------------------------
 
-if [[ $EUID -ne 0 ]]; then
+if [[ $(id -u) -ne 0 ]]; then
     log_error "Please run this script with sudo or as root."
     exit 1
 fi
 
 log_info "Starting Ubuntu 22.04 XRDP + LXDE provisioning..."
 log_info "Detected real user: ${REAL_USER}"
+log_info "Detected home directory: ${REAL_HOME}"
 
 # ---------------------------------------------------------
 # Update System
@@ -68,23 +92,23 @@ log_info "Updating package lists and upgrading system..."
 
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update -y
-apt-get upgrade -y
+run_or_fail "apt-get update" apt-get update -y || exit 1
+run_or_fail "apt-get upgrade" apt-get upgrade -y || exit 1
 
 # ---------------------------------------------------------
-# Install LXDE Desktop Environment
+# Install LXDE Desktop Environment (Corrected Packages)
 # ---------------------------------------------------------
 
 log_info "Installing LXDE desktop environment..."
 
 apt-get install -y \
     lxde-core \
-    lxsession \
     openbox \
-    lightdm
+    lightdm \
+    || { log_error "Failed to install LXDE"; exit 1; }
 
 # ---------------------------------------------------------
-# Install Required Software
+# Install Required Software (Corrected Packages)
 # ---------------------------------------------------------
 
 log_info "Installing productivity and audio packages..."
@@ -95,7 +119,9 @@ apt-get install -y \
     wget \
     curl \
     git \
-    xorgxrdp
+    xrdp \
+    xorgxrdp-generic \
+    || { log_error "Failed to install packages"; exit 1; }
 
 # ---------------------------------------------------------
 # Configure LXDE as Default XRDP Session
@@ -138,40 +164,63 @@ startlxde
 EOF
 
 chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/.xsession"
+chmod 600 "${REAL_HOME}/.xsession"
 
 # ---------------------------------------------------------
-# Configure Swap File
+# Configure Swap File (With Verification)
 # ---------------------------------------------------------
 
-if swapon --show | grep -q "/swapfile"; then
+if swapon --show | grep -q "^/swapfile"; then
     log_warn "Swapfile already exists and is active."
 else
     log_info "Creating 2GB swap file..."
 
-    fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
-
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
-
-    if ! grep -q "^/swapfile" /etc/fstab; then
-        echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    if ! fallocate -l 2G /swapfile 2>/dev/null; then
+        log_info "fallocate not available, using dd..."
+        dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress || { log_error "Failed to create swap file"; exit 1; }
     fi
-
-    log_info "Swap file created and activated."
+    
+    # Verify swap file was created before proceeding
+    if [[ ! -f /swapfile ]]; then
+        log_error "Swap file was not created successfully"
+        exit 1
+    fi
+    
+    chmod 600 /swapfile
+    mkswap /swapfile || { log_error "Failed to format swap file"; rm -f /swapfile; exit 1; }
+    swapon /swapfile || { log_error "Failed to activate swap"; rm -f /swapfile; exit 1; }
+    
+    # Verify swap is active before updating fstab
+    if swapon --show | grep -q "^/swapfile"; then
+        if ! grep -q "^/swapfile" /etc/fstab 2>/dev/null; then
+            echo "/swapfile none swap sw 0 0" >> /etc/fstab
+            log_info "Added swapfile to /etc/fstab"
+        fi
+        log_info "Swap file created and activated."
+    else
+        log_error "Swap verification failed after activation"
+        exit 1
+    fi
 fi
 
 # ---------------------------------------------------------
-# Disable Non-Essential Services
+# Disable Non-Essential Services (With Proper Error Handling)
 # ---------------------------------------------------------
 
 log_info "Disabling unnecessary services..."
 
-systemctl disable bluetooth.service || true
-systemctl stop bluetooth.service || true
+disable_service() {
+    local svc="$1"
+    if systemctl list-unit-files "$svc" &>/dev/null; then
+        systemctl disable "$svc" 2>/dev/null || true
+        systemctl stop "$svc" 2>/dev/null || log_warn "Service ${svc} not running or already stopped"
+    else
+        log_warn "Service ${svc} not found, skipping"
+    fi
+}
 
-systemctl disable cups.service || true
-systemctl stop cups.service || true
+disable_service bluetooth.service
+disable_service cups.service
 
 # ---------------------------------------------------------
 # Download and Install Latest C-Nergy XRDP Script
@@ -179,10 +228,14 @@ systemctl stop cups.service || true
 
 log_info "Downloading latest C-Nergy XRDP installation script..."
 
-TMP_SCRIPT="/tmp/xrdp-installer.sh"
+TMP_SCRIPT="/tmp/xrdp-installer-$(date +%s).sh"
 
-wget -O "$TMP_SCRIPT" \
-https://www.c-nergy.be/downloads/xRDP/xrdp-installer-1.5.3.sh
+# Verify wget success with exit code check
+if ! wget -q -O "$TMP_SCRIPT" \
+    https://www.c-nergy.be/downloads/xRDP/xrdp-installer-1.5.3.sh; then
+    log_error "Failed to download XRDP installer"
+    exit 1
+fi
 
 chmod +x "$TMP_SCRIPT"
 
@@ -210,12 +263,17 @@ systemctl enable xrdp
 systemctl restart xrdp
 
 # ---------------------------------------------------------
-# Add User to SSL-CERT Group
+# Add User to SSL-CERT Group (With Verification)
 # ---------------------------------------------------------
 
 log_info "Adding ${REAL_USER} to ssl-cert group..."
 
-usermod -aG ssl-cert "$REAL_USER"
+if ! getent group ssl-cert | grep -q ":${REAL_USER}"; then
+    usermod -aG ssl-cert "$REAL_USER"
+    log_info "User ${REAL_USER} added to ssl-cert group"
+else
+    log_info "User ${REAL_USER} already in ssl-cert group"
+fi
 
 # ---------------------------------------------------------
 # XRDP Polkit Fix
@@ -243,13 +301,14 @@ polkit.addRule(function(action, subject) {
 });
 EOF
 
+chmod 644 "$POLKIT_RULE"
+
 # ---------------------------------------------------------
-# Cleanup
+# Cleanup (Safer approach - skip autoremove in provisioning)
 # ---------------------------------------------------------
 
-log_info "Cleaning unnecessary packages..."
+log_info "Cleaning up package caches..."
 
-apt-get autoremove -y
 apt-get autoclean -y
 
 # ---------------------------------------------------------
